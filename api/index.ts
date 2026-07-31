@@ -2,7 +2,7 @@
 import serverless from 'serverless-http';
 import express from 'express';
 import cors from 'cors';
-import { pool } from './db.js';
+import { supabase } from './db.js';
 
 const app = express();
 app.use(cors());
@@ -10,107 +10,143 @@ app.use(express.json());
 
 // 1. GET: Champion Performance
 app.get('/api/analytics/champions', async (req, res) => {
-  const query = `
-    SELECT 
-      p.champion_id,
-      p.role,
-      COUNT(*) AS times_picked,
-      SUM(CASE WHEN g.our_side = 'BLUE' THEN 1 ELSE 0 END) AS blue_picks,
-      SUM(CASE WHEN g.our_side = 'RED' THEN 1 ELSE 0 END) AS red_picks,
-      SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS wins,
-      SUM(CASE WHEN g.result = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-      ROUND((CAST(SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS NUMERIC) / COUNT(*)) * 100, 1) AS win_rate
-    FROM draft_picks p
-    JOIN scrim_games g ON p.game_id = g.id
-    JOIN scrim_blocks b ON g.block_id = b.id
-    WHERE p.team = 'OUR_TEAM'
-    GROUP BY p.champion_id, p.role
-    ORDER BY times_picked DESC
-  `;
-
-  console.log('[DB READ] Fetching champion analytics...');
-  const startTime = Date.now();
-
   try {
-    const { rows } = await pool.query(query);
-    const duration = Date.now() - startTime;
-    console.log(`[DB READ SUCCESS] Champion analytics retrieved (${rows.length} rows) in ${duration}ms`);
-    res.json(rows);
+    const { data, error } = await supabase.rpc('get_champion_analytics');
+    
+    // Fallback direct table query if RPC is not created yet
+    if (error) {
+      const { data: rawPicks, error: fetchErr } = await supabase
+        .from('draft_picks')
+        .select(`
+          champion_id,
+          role,
+          team,
+          scrim_games!inner (
+            our_side,
+            result
+          )
+        `)
+        .eq('team', 'OUR_TEAM');
+
+      if (fetchErr) throw fetchErr;
+
+      // Group and calculate stats in JS to avoid raw TCP requirements
+      const statsMap: Record<string, any> = {};
+
+      rawPicks?.forEach((pick: any) => {
+        const key = `${pick.champion_id}-${pick.role}`;
+        if (!statsMap[key]) {
+          statsMap[key] = {
+            champion_id: pick.champion_id,
+            role: pick.role,
+            times_picked: 0,
+            blue_picks: 0,
+            red_picks: 0,
+            wins: 0,
+            losses: 0,
+            win_rate: 0,
+          };
+        }
+
+        const stat = statsMap[key];
+        stat.times_picked += 1;
+        if (pick.scrim_games.our_side === 'BLUE') stat.blue_picks += 1;
+        if (pick.scrim_games.our_side === 'RED') stat.red_picks += 1;
+        if (pick.scrim_games.result === 'WIN') stat.wins += 1;
+        if (pick.scrim_games.result === 'LOSS') stat.losses += 1;
+        stat.win_rate = Number(((stat.wins / stat.times_picked) * 100).toFixed(1));
+      });
+
+      return res.json(Object.values(statsMap));
+    }
+
+    res.json(data);
   } catch (err: any) {
-    console.error('[DB READ ERROR] Champion analytics failed:', err.message);
+    console.error('[HTTP ERROR]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // 2. GET: Head-to-Head Opponent Analytics
 app.get('/api/analytics/opponents', async (req, res) => {
-  const query = `
-    SELECT 
-      b.opponent_name,
-      COUNT(g.id) AS games_played,
-      SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS wins,
-      SUM(CASE WHEN g.result = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-      ROUND((CAST(SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS NUMERIC) / COUNT(g.id)) * 100, 1) AS win_rate
-    FROM scrim_blocks b
-    JOIN scrim_games g ON b.id = g.block_id
-    GROUP BY b.opponent_name
-    ORDER BY games_played DESC
-  `;
-
-  console.log('[DB READ] Fetching opponent analytics...');
-  const startTime = Date.now();
-
   try {
-    const { rows } = await pool.query(query);
-    const duration = Date.now() - startTime;
-    console.log(`[DB READ SUCCESS] Opponent analytics retrieved (${rows.length} rows) in ${duration}ms`);
-    res.json(rows);
+    const { data: blocks, error } = await supabase
+      .from('scrim_blocks')
+      .select(`
+        opponent_name,
+        scrim_games (
+          id,
+          result
+        )
+      `);
+
+    if (error) throw error;
+
+    const oppMap: Record<string, any> = {};
+
+    blocks?.forEach((b: any) => {
+      const name = b.opponent_name;
+      if (!oppMap[name]) {
+        oppMap[name] = { opponent_name: name, games_played: 0, wins: 0, losses: 0, win_rate: 0 };
+      }
+
+      b.scrim_games?.forEach((g: any) => {
+        oppMap[name].games_played += 1;
+        if (g.result === 'WIN') oppMap[name].wins += 1;
+        if (g.result === 'LOSS') oppMap[name].losses += 1;
+      });
+
+      if (oppMap[name].games_played > 0) {
+        oppMap[name].win_rate = Number(((oppMap[name].wins / oppMap[name].games_played) * 100).toFixed(1));
+      }
+    });
+
+    res.json(Object.values(oppMap));
   } catch (err: any) {
-    console.error('[DB READ ERROR] Opponent analytics failed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // 3. GET: Fetch Scrim Blocks
 app.get('/api/scrim-blocks', async (req, res) => {
-  const queryBlocks = `SELECT * FROM scrim_blocks ORDER BY id DESC`;
-
-  console.log('[DB READ] Fetching scrim blocks & game history...');
-  const startTime = Date.now();
-
   try {
-    const blocksResult = await pool.query(queryBlocks);
-    const blocks = blocksResult.rows;
+    const { data: blocks, error: blockErr } = await supabase
+      .from('scrim_blocks')
+      .select('*')
+      .order('id', { ascending: false });
 
-    const queryGames = `
-      SELECT 
-        g.id, g.block_id, g.game_number, g.our_side, g.result, g.patch_version,
-        (
-          SELECT STRING_AGG(role || ': ' || champion_id, ', ')
-          FROM draft_picks WHERE game_id = g.id AND team = 'OUR_TEAM'
-        ) AS our_draft,
-        (
-          SELECT STRING_AGG(role || ': ' || champion_id, ', ')
-          FROM draft_picks WHERE game_id = g.id AND team = 'ENEMY'
-        ) AS enemy_draft
-      FROM scrim_games g
-      ORDER BY g.game_number ASC
-    `;
+    if (blockErr) throw blockErr;
 
-    const gamesResult = await pool.query(queryGames);
-    const games = gamesResult.rows;
+    const { data: games, error: gameErr } = await supabase
+      .from('scrim_games')
+      .select(`
+        id, block_id, game_number, our_side, result, patch_version,
+        draft_picks (
+          champion_id, role, team
+        )
+      `)
+      .order('game_number', { ascending: true });
 
-    const result = blocks.map((b: any) => ({
+    if (gameErr) throw gameErr;
+
+    const result = blocks?.map((b: any) => ({
       ...b,
-      games: games.filter((g: any) => g.block_id === b.id),
-    }));
+      games: games
+        ?.filter((g: any) => g.block_id === b.id)
+        .map((g: any) => {
+          const ourPicks = g.draft_picks?.filter((p: any) => p.team === 'OUR_TEAM') || [];
+          const enemyPicks = g.draft_picks?.filter((p: any) => p.team === 'ENEMY') || [];
 
-    const duration = Date.now() - startTime;
-    console.log(`[DB READ SUCCESS] Scrim blocks retrieved (${blocks.length} blocks, ${games.length} games) in ${duration}ms`);
+          return {
+            ...g,
+            our_draft: ourPicks.map((p: any) => `${p.role}: ${p.champion_id}`).join(', '),
+            enemy_draft: enemyPicks.map((p: any) => `${p.role}: ${p.champion_id}`).join(', '),
+          };
+        }),
+    }));
 
     res.json(result);
   } catch (err: any) {
-    console.error('[DB READ ERROR] Scrim blocks fetch failed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -118,59 +154,65 @@ app.get('/api/scrim-blocks', async (req, res) => {
 // 4. POST: Save Scrim Block Series
 app.post('/api/scrim-blocks', async (req, res) => {
   const { opponentName, notes, games } = req.body;
-  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
+    // 1. Insert Scrim Block
+    const { data: block, error: blockErr } = await supabase
+      .from('scrim_blocks')
+      .insert({ opponent_name: opponentName || 'Unknown Opponent', notes: notes || '' })
+      .select('id')
+      .single();
 
-    const blockResult = await client.query(
-      `INSERT INTO scrim_blocks (opponent_name, notes) VALUES ($1, $2) RETURNING id`,
-      [opponentName || 'Unknown Opponent', notes || '']
-    );
+    if (blockErr) throw blockErr;
+    const blockId = block.id;
 
-    const blockId = blockResult.rows[0].id;
-
+    // 2. Insert Games & Draft Picks over HTTPS
     if (games && Array.isArray(games)) {
       for (let idx = 0; idx < games.length; idx++) {
         const gameData = games[idx];
         const gameNumber = idx + 1;
 
-        const gameResult = await client.query(
-          `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-          [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result]
-        );
+        const { data: game, error: gameErr } = await supabase
+          .from('scrim_games')
+          .insert({
+            block_id: blockId,
+            game_number: gameNumber,
+            patch_version: gameData.patchVersion || '',
+            our_side: gameData.ourSide,
+            result: gameData.result,
+          })
+          .select('id')
+          .single();
 
-        const gameId = gameResult.rows[0].id;
+        if (gameErr) throw gameErr;
+        const gameId = game.id;
 
-        if (gameData.ourPicks && Array.isArray(gameData.ourPicks)) {
-          for (const p of gameData.ourPicks) {
-            await client.query(
-              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
-              [gameId, p.championId, 'OUR_TEAM', p.role, 'P1']
-            );
-          }
+        const picksToInsert: any[] = [];
+
+        if (gameData.ourPicks) {
+          gameData.ourPicks.forEach((p: any) => {
+            picksToInsert.push({ game_id: gameId, champion_id: p.championId, team: 'OUR_TEAM', role: p.role, pick_phase: 'P1' });
+          });
         }
 
-        if (gameData.enemyPicks && Array.isArray(gameData.enemyPicks)) {
-          for (const p of gameData.enemyPicks) {
-            await client.query(
-              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
-              [gameId, p.championId, 'ENEMY', p.role, 'P1']
-            );
-          }
+        if (gameData.enemyPicks) {
+          gameData.enemyPicks.forEach((p: any) => {
+            picksToInsert.push({ game_id: gameId, champion_id: p.championId, team: 'ENEMY', role: p.role, pick_phase: 'P1' });
+          });
+        }
+
+        if (picksToInsert.length > 0) {
+          const { error: pickErr } = await supabase.from('draft_picks').insert(picksToInsert);
+          if (pickErr) throw pickErr;
         }
       }
     }
 
-    await client.query('COMMIT');
-    console.log(`[DB WRITE SUCCESS] Created Scrim Block #${blockId} with ${games?.length || 0} games.`);
+    console.log(`[HTTP SUCCESS] Saved Scrim Block #${blockId}`);
     res.json({ success: true, blockId });
   } catch (err: any) {
-    await client.query('ROLLBACK');
-    console.error('[DB WRITE ERROR] Failed to save scrim block:', err.message);
+    console.error('[HTTP POST ERROR]', err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 });
 
@@ -178,96 +220,84 @@ app.post('/api/scrim-blocks', async (req, res) => {
 app.put('/api/scrim-blocks/:id', async (req, res) => {
   const blockId = req.params.id;
   const { opponentName, notes, games } = req.body;
-  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
+    await supabase
+      .from('scrim_blocks')
+      .update({ opponent_name: opponentName, notes: notes })
+      .eq('id', blockId);
 
-    await client.query(
-      `UPDATE scrim_blocks SET opponent_name = $1, notes = $2 WHERE id = $3`,
-      [opponentName, notes, blockId]
-    );
-
-    const oldGames = await client.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [blockId]);
-    const oldGameIds = oldGames.rows.map((g) => g.id);
+    // Delete existing games (Cascade deletes draft_picks if FK set, or manually delete)
+    const { data: oldGames } = await supabase.from('scrim_games').select('id').eq('block_id', blockId);
+    const oldGameIds = oldGames?.map((g) => g.id) || [];
 
     if (oldGameIds.length > 0) {
-      await client.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [oldGameIds]);
+      await supabase.from('draft_picks').delete().in('game_id', oldGameIds);
     }
+    await supabase.from('scrim_games').delete().eq('block_id', blockId);
 
-    await client.query(`DELETE FROM scrim_games WHERE block_id = $1`, [blockId]);
-
+    // Re-insert games
     if (games && Array.isArray(games)) {
       for (let idx = 0; idx < games.length; idx++) {
         const gameData = games[idx];
         const gameNumber = idx + 1;
 
-        const gameResult = await client.query(
-          `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-          [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result]
-        );
+        const { data: game, error: gameErr } = await supabase
+          .from('scrim_games')
+          .insert({
+            block_id: blockId,
+            game_number: gameNumber,
+            patch_version: gameData.patchVersion || '',
+            our_side: gameData.ourSide,
+            result: gameData.result,
+          })
+          .select('id')
+          .single();
 
-        const gameId = gameResult.rows[0].id;
+        if (gameErr) throw gameErr;
+        const gameId = game.id;
 
-        if (gameData.ourPicks && Array.isArray(gameData.ourPicks)) {
-          for (const p of gameData.ourPicks) {
-            await client.query(
-              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
-              [gameId, p.championId, 'OUR_TEAM', p.role, 'P1']
-            );
-          }
+        const picksToInsert: any[] = [];
+        if (gameData.ourPicks) {
+          gameData.ourPicks.forEach((p: any) => {
+            picksToInsert.push({ game_id: gameId, champion_id: p.championId, team: 'OUR_TEAM', role: p.role, pick_phase: 'P1' });
+          });
+        }
+        if (gameData.enemyPicks) {
+          gameData.enemyPicks.forEach((p: any) => {
+            picksToInsert.push({ game_id: gameId, champion_id: p.championId, team: 'ENEMY', role: p.role, pick_phase: 'P1' });
+          });
         }
 
-        if (gameData.enemyPicks && Array.isArray(gameData.enemyPicks)) {
-          for (const p of gameData.enemyPicks) {
-            await client.query(
-              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
-              [gameId, p.championId, 'ENEMY', p.role, 'P1']
-            );
-          }
+        if (picksToInsert.length > 0) {
+          await supabase.from('draft_picks').insert(picksToInsert);
         }
       }
     }
 
-    await client.query('COMMIT');
-    console.log(`[DB WRITE SUCCESS] Updated Scrim Block #${blockId}.`);
     res.json({ success: true, updatedBlockId: blockId });
   } catch (err: any) {
-    await client.query('ROLLBACK');
-    console.error(`[DB WRITE ERROR] Failed to update scrim block #${blockId}:`, err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 });
 
 // 6. DELETE: Remove Scrim Block
 app.delete('/api/scrim-blocks/:id', async (req, res) => {
   const { id } = req.params;
-  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-
-    const games = await client.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [id]);
-    const gameIds = games.rows.map((g) => g.id);
+    const { data: games } = await supabase.from('scrim_games').select('id').eq('block_id', id);
+    const gameIds = games?.map((g) => g.id) || [];
 
     if (gameIds.length > 0) {
-      await client.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [gameIds]);
-      await client.query(`DELETE FROM scrim_games WHERE block_id = $1`, [id]);
+      await supabase.from('draft_picks').delete().in('game_id', gameIds);
+      await supabase.from('scrim_games').delete().eq('block_id', id);
     }
 
-    await client.query(`DELETE FROM scrim_blocks WHERE id = $1`, [id]);
-
-    await client.query('COMMIT');
-    console.log(`[DB WRITE SUCCESS] Deleted Scrim Block #${id}.`);
+    await supabase.from('scrim_blocks').delete().eq('id', id);
     res.json({ success: true, deletedBlockId: id });
   } catch (err: any) {
-    await client.query('ROLLBACK');
-    console.error(`[DB WRITE ERROR] Failed to delete scrim block #${id}:`, err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 });
 
