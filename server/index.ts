@@ -1,19 +1,16 @@
 // server/index.ts
 import express from 'express';
 import cors from 'cors';
-import db from './db';
+import { pool } from './db.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 3001;
-
-// Enable SQLite Foreign Key Support
-db.run('PRAGMA foreign_keys = ON;');
+const PORT = process.env.PORT || 3001;
 
 // 1. GET: Champion Performance
-app.get('/api/analytics/champions', (req, res) => {
+app.get('/api/analytics/champions', async (req, res) => {
   const query = `
     SELECT 
       p.champion_id,
@@ -23,7 +20,7 @@ app.get('/api/analytics/champions', (req, res) => {
       SUM(CASE WHEN g.our_side = 'RED' THEN 1 ELSE 0 END) AS red_picks,
       SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS wins,
       SUM(CASE WHEN g.result = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-      ROUND((CAST(SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*)) * 100, 1) AS win_rate
+      ROUND((CAST(SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS NUMERIC) / COUNT(*)) * 100, 1) AS win_rate
     FROM draft_picks p
     JOIN scrim_games g ON p.game_id = g.id
     JOIN scrim_blocks b ON g.block_id = b.id
@@ -32,217 +29,217 @@ app.get('/api/analytics/champions', (req, res) => {
     ORDER BY times_picked DESC
   `;
 
-  db.all(query, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+  try {
+    const { rows } = await pool.query(query);
     res.json(rows);
-  });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 2. GET: Head-to-Head Opponent Analytics
-app.get('/api/analytics/opponents', (req, res) => {
+app.get('/api/analytics/opponents', async (req, res) => {
   const query = `
     SELECT 
       b.opponent_name,
       COUNT(g.id) AS games_played,
       SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS wins,
       SUM(CASE WHEN g.result = 'LOSS' THEN 1 ELSE 0 END) AS losses,
-      ROUND((CAST(SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS FLOAT) / COUNT(g.id)) * 100, 1) AS win_rate
+      ROUND((CAST(SUM(CASE WHEN g.result = 'WIN' THEN 1 ELSE 0 END) AS NUMERIC) / COUNT(g.id)) * 100, 1) AS win_rate
     FROM scrim_blocks b
     JOIN scrim_games g ON b.id = g.block_id
     GROUP BY b.opponent_name
     ORDER BY games_played DESC
   `;
 
-  db.all(query, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+  try {
+    const { rows } = await pool.query(query);
     res.json(rows);
-  });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 3. GET: Fetch Scrim Blocks
-app.get('/api/scrim-blocks', (req, res) => {
+app.get('/api/scrim-blocks', async (req, res) => {
   const queryBlocks = `SELECT * FROM scrim_blocks ORDER BY id DESC`;
 
-  db.all(queryBlocks, [], (err, blocks) => {
-    if (err) return res.status(500).json({ error: err.message });
+  try {
+    const blocksResult = await pool.query(queryBlocks);
+    const blocks = blocksResult.rows;
 
     const queryGames = `
       SELECT 
         g.id, g.block_id, g.game_number, g.our_side, g.result, g.patch_version,
         (
-          SELECT GROUP_CONCAT(role || ': ' || champion_id, ', ')
+          SELECT STRING_AGG(role || ': ' || champion_id, ', ')
           FROM draft_picks WHERE game_id = g.id AND team = 'OUR_TEAM'
         ) AS our_draft,
         (
-          SELECT GROUP_CONCAT(role || ': ' || champion_id, ', ')
+          SELECT STRING_AGG(role || ': ' || champion_id, ', ')
           FROM draft_picks WHERE game_id = g.id AND team = 'ENEMY'
         ) AS enemy_draft
       FROM scrim_games g
       ORDER BY g.game_number ASC
     `;
 
-    db.all(queryGames, [], (err, games) => {
-      if (err) return res.status(500).json({ error: err.message });
+    const gamesResult = await pool.query(queryGames);
+    const games = gamesResult.rows;
 
-      const result = blocks.map((b: any) => ({
-        ...b,
-        games: games.filter((g: any) => g.block_id === b.id),
-      }));
+    const result = blocks.map((b: any) => ({
+      ...b,
+      games: games.filter((g: any) => g.block_id === b.id),
+    }));
 
-      res.json(result);
-    });
-  });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 4. POST: Save Scrim Block Series
-app.post('/api/scrim-blocks', (req, res) => {
+app.post('/api/scrim-blocks', async (req, res) => {
   const { opponentName, notes, games } = req.body;
 
-  db.run(
-    `INSERT INTO scrim_blocks (opponent_name, notes) VALUES (?, ?)`,
-    [opponentName || 'Unknown Opponent', notes || ''],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
+  try {
+    const blockResult = await pool.query(
+      `INSERT INTO scrim_blocks (opponent_name, notes) VALUES ($1, $2) RETURNING id`,
+      [opponentName || 'Unknown Opponent', notes || '']
+    );
 
-      const blockId = this.lastID;
+    const blockId = blockResult.rows[0].id;
 
-      if (!games || !Array.isArray(games)) {
-        return res.json({ success: true, blockId });
-      }
-
-      games.forEach((gameData: any, idx: number) => {
+    if (games && Array.isArray(games)) {
+      for (let idx = 0; idx < games.length; idx++) {
+        const gameData = games[idx];
         const gameNumber = idx + 1;
-        db.run(
-          `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES (?, ?, ?, ?, ?)`,
-          [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result],
-          function (err) {
-            if (err) return;
-            const gameId = this.lastID;
-            const pickStmt = db.prepare(
-              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES (?, ?, ?, ?, ?)`
-            );
 
-            if (gameData.ourPicks) {
-              gameData.ourPicks.forEach((p: any) => pickStmt.run(gameId, p.championId, 'OUR_TEAM', p.role, 'P1'));
-            }
-            if (gameData.enemyPicks) {
-              gameData.enemyPicks.forEach((p: any) => pickStmt.run(gameId, p.championId, 'ENEMY', p.role, 'P1'));
-            }
-
-            pickStmt.finalize();
-          }
+        const gameResult = await pool.query(
+          `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result]
         );
-      });
 
-      res.json({ success: true, blockId });
+        const gameId = gameResult.rows[0].id;
+
+        if (gameData.ourPicks) {
+          for (const p of gameData.ourPicks) {
+            await pool.query(
+              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
+              [gameId, p.championId, 'OUR_TEAM', p.role, 'P1']
+            );
+          }
+        }
+
+        if (gameData.enemyPicks) {
+          for (const p of gameData.enemyPicks) {
+            await pool.query(
+              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
+              [gameId, p.championId, 'ENEMY', p.role, 'P1']
+            );
+          }
+        }
+      }
     }
-  );
+
+    res.json({ success: true, blockId });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 5. PUT: Update Scrim Block
-app.put('/api/scrim-blocks/:id', (req, res) => {
+app.put('/api/scrim-blocks/:id', async (req, res) => {
   const blockId = req.params.id;
   const { opponentName, notes, games } = req.body;
 
-  db.run(
-    `UPDATE scrim_blocks SET opponent_name = ?, notes = ? WHERE id = ?`,
-    [opponentName, notes, blockId],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
+  try {
+    await pool.query(
+      `UPDATE scrim_blocks SET opponent_name = $1, notes = $2 WHERE id = $3`,
+      [opponentName, notes, blockId]
+    );
 
-      db.all(`SELECT id FROM scrim_games WHERE block_id = ?`, [blockId], (err, oldGames: any[]) => {
-        if (err) return res.status(500).json({ error: err.message });
+    const oldGames = await pool.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [blockId]);
+    const oldGameIds = oldGames.rows.map((g) => g.id);
 
-        const oldGameIds = oldGames.map((g) => g.id);
-        if (oldGameIds.length > 0) {
-          const placeholders = oldGameIds.map(() => '?').join(',');
-          db.run(`DELETE FROM draft_picks WHERE game_id IN (${placeholders})`, oldGameIds);
+    if (oldGameIds.length > 0) {
+      await pool.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [oldGameIds]);
+    }
+
+    await pool.query(`DELETE FROM scrim_games WHERE block_id = $1`, [blockId]);
+
+    if (games && Array.isArray(games)) {
+      for (let idx = 0; idx < games.length; idx++) {
+        const gameData = games[idx];
+        const gameNumber = idx + 1;
+
+        const gameResult = await pool.query(
+          `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result]
+        );
+
+        const gameId = gameResult.rows[0].id;
+
+        if (gameData.ourPicks) {
+          for (const p of gameData.ourPicks) {
+            await pool.query(
+              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
+              [gameId, p.championId, 'OUR_TEAM', p.role, 'P1']
+            );
+          }
         }
 
-        db.run(`DELETE FROM scrim_games WHERE block_id = ?`, [blockId], function (err) {
-          if (err) return res.status(500).json({ error: err.message });
-
-          games.forEach((gameData: any, idx: number) => {
-            const gameNumber = idx + 1;
-            db.run(
-              `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES (?, ?, ?, ?, ?)`,
-              [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result],
-              function (err) {
-                if (err) return;
-                const gameId = this.lastID;
-                const pickStmt = db.prepare(
-                  `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES (?, ?, ?, ?, ?)`
-                );
-
-                if (gameData.ourPicks) {
-                  gameData.ourPicks.forEach((p: any) => pickStmt.run(gameId, p.championId, 'OUR_TEAM', p.role, 'P1'));
-                }
-                if (gameData.enemyPicks) {
-                  gameData.enemyPicks.forEach((p: any) => pickStmt.run(gameId, p.championId, 'ENEMY', p.role, 'P1'));
-                }
-
-                pickStmt.finalize();
-              }
+        if (gameData.enemyPicks) {
+          for (const p of gameData.enemyPicks) {
+            await pool.query(
+              `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
+              [gameId, p.championId, 'ENEMY', p.role, 'P1']
             );
-          });
-
-          res.json({ success: true, updatedBlockId: blockId });
-        });
-      });
+          }
+        }
+      }
     }
-  );
+
+    res.json({ success: true, updatedBlockId: blockId });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 6. DELETE: Remove Scrim Block and ALL Associated Games/Draft Picks
-app.delete('/api/scrim-blocks/:id', (req, res) => {
+app.delete('/api/scrim-blocks/:id', async (req, res) => {
   const { id } = req.params;
 
-  // Find all games belonging to this block first
-  db.all(`SELECT id FROM scrim_games WHERE block_id = ?`, [id], (err, games: any[]) => {
-    if (err) return res.status(500).json({ error: err.message });
-
-    const gameIds = games ? games.map((g) => g.id) : [];
+  try {
+    const games = await pool.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [id]);
+    const gameIds = games.rows.map((g) => g.id);
 
     if (gameIds.length > 0) {
-      const placeholders = gameIds.map(() => '?').join(',');
-      // Delete all draft picks connected to these games
-      db.run(`DELETE FROM draft_picks WHERE game_id IN (${placeholders})`, gameIds, (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-
-        // Delete the games
-        db.run(`DELETE FROM scrim_games WHERE block_id = ?`, [id], (err) => {
-          if (err) return res.status(500).json({ error: err.message });
-
-          // Delete the block itself
-          db.run(`DELETE FROM scrim_blocks WHERE id = ?`, [id], (err) => {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ success: true, deletedBlockId: id });
-          });
-        });
-      });
-    } else {
-      // Just delete the block if no games exist
-      db.run(`DELETE FROM scrim_blocks WHERE id = ?`, [id], (err) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ success: true, deletedBlockId: id });
-      });
+      await pool.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [gameIds]);
+      await pool.query(`DELETE FROM scrim_games WHERE block_id = $1`, [id]);
     }
-  });
+
+    await pool.query(`DELETE FROM scrim_blocks WHERE id = $1`, [id]);
+    res.json({ success: true, deletedBlockId: id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Endpoint to clean up old orphaned games (without valid blocks)
-app.delete('/api/scrim-blocks-cleanup', (req, res) => {
-  db.run(
-    `DELETE FROM draft_picks WHERE game_id NOT IN (SELECT id FROM scrim_games WHERE block_id IS NOT NULL)`,
-    [],
-    function () {
-      db.run(`DELETE FROM scrim_games WHERE block_id IS NULL OR block_id NOT IN (SELECT id FROM scrim_blocks)`, [], function () {
-        res.json({ success: true, message: 'Orphaned match stats cleared!' });
-      });
-    }
-  );
+app.delete('/api/scrim-blocks-cleanup', async (req, res) => {
+  try {
+    await pool.query(
+      `DELETE FROM draft_picks WHERE game_id NOT IN (SELECT id FROM scrim_games WHERE block_id IS NOT NULL)`
+    );
+    await pool.query(
+      `DELETE FROM scrim_games WHERE block_id IS NULL OR block_id NOT IN (SELECT id FROM scrim_blocks)`
+    );
+    res.json({ success: true, message: 'Orphaned match stats cleared!' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Scrim Analytics API Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Scrim Analytics API Server running on port ${PORT}`);
 });
