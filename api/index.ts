@@ -28,10 +28,16 @@ app.get('/api/analytics/champions', async (req, res) => {
     ORDER BY times_picked DESC
   `;
 
+  console.log('[DB READ] Fetching champion analytics...');
+  const startTime = Date.now();
+
   try {
     const { rows } = await pool.query(query);
+    const duration = Date.now() - startTime;
+    console.log(`[DB READ SUCCESS] Champion analytics retrieved (${rows.length} rows) in ${duration}ms`);
     res.json(rows);
   } catch (err: any) {
+    console.error('[DB READ ERROR] Champion analytics failed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -51,10 +57,16 @@ app.get('/api/analytics/opponents', async (req, res) => {
     ORDER BY games_played DESC
   `;
 
+  console.log('[DB READ] Fetching opponent analytics...');
+  const startTime = Date.now();
+
   try {
     const { rows } = await pool.query(query);
+    const duration = Date.now() - startTime;
+    console.log(`[DB READ SUCCESS] Opponent analytics retrieved (${rows.length} rows) in ${duration}ms`);
     res.json(rows);
   } catch (err: any) {
+    console.error('[DB READ ERROR] Opponent analytics failed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -62,6 +74,9 @@ app.get('/api/analytics/opponents', async (req, res) => {
 // 3. GET: Fetch Scrim Blocks
 app.get('/api/scrim-blocks', async (req, res) => {
   const queryBlocks = `SELECT * FROM scrim_blocks ORDER BY id DESC`;
+
+  console.log('[DB READ] Fetching scrim blocks & game history...');
+  const startTime = Date.now();
 
   try {
     const blocksResult = await pool.query(queryBlocks);
@@ -90,8 +105,12 @@ app.get('/api/scrim-blocks', async (req, res) => {
       games: games.filter((g: any) => g.block_id === b.id),
     }));
 
+    const duration = Date.now() - startTime;
+    console.log(`[DB READ SUCCESS] Scrim blocks retrieved (${blocks.length} blocks, ${games.length} games) in ${duration}ms`);
+
     res.json(result);
   } catch (err: any) {
+    console.error('[DB READ ERROR] Scrim blocks fetch failed:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -140,8 +159,10 @@ app.post('/api/scrim-blocks', async (req, res) => {
       }
     }
 
+    console.log(`[DB WRITE SUCCESS] Created new Scrim Block #${blockId} with ${games?.length || 0} games.`);
     res.json({ success: true, blockId });
   } catch (err: any) {
+    console.error('[DB WRITE ERROR] Failed to save scrim block:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -198,8 +219,10 @@ app.put('/api/scrim-blocks/:id', async (req, res) => {
       }
     }
 
+    console.log(`[DB WRITE SUCCESS] Updated Scrim Block #${blockId}.`);
     res.json({ success: true, updatedBlockId: blockId });
   } catch (err: any) {
+    console.error(`[DB WRITE ERROR] Failed to update scrim block #${blockId}:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -218,8 +241,10 @@ app.delete('/api/scrim-blocks/:id', async (req, res) => {
     }
 
     await pool.query(`DELETE FROM scrim_blocks WHERE id = $1`, [id]);
+    console.log(`[DB WRITE SUCCESS] Deleted Scrim Block #${id}.`);
     res.json({ success: true, deletedBlockId: id });
   } catch (err: any) {
+    console.error(`[DB WRITE ERROR] Failed to delete scrim block #${id}:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
