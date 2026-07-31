@@ -228,8 +228,8 @@ export default function App() {
     };
 
     const url = editingBlockId
-      ? `api/scrim-blocks/${editingBlockId}`
-      : '/scrim-blocks';
+      ? `/api/scrim-blocks/${editingBlockId}`
+      : '/api/scrim-blocks';
 
     const method = editingBlockId ? 'PUT' : 'POST';
 
