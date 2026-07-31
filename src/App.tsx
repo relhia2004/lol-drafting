@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Search, PlusCircle, Trophy, X, BarChart3, Users, Trash2, Swords, Edit3, Plus, Layers } from 'lucide-react';
 
 export interface Champion {
