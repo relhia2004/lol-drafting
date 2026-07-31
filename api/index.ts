@@ -118,9 +118,12 @@ app.get('/api/scrim-blocks', async (req, res) => {
 // 4. POST: Save Scrim Block Series
 app.post('/api/scrim-blocks', async (req, res) => {
   const { opponentName, notes, games } = req.body;
+  const client = await pool.connect();
 
   try {
-    const blockResult = await pool.query(
+    await client.query('BEGIN');
+
+    const blockResult = await client.query(
       `INSERT INTO scrim_blocks (opponent_name, notes) VALUES ($1, $2) RETURNING id`,
       [opponentName || 'Unknown Opponent', notes || '']
     );
@@ -132,25 +135,25 @@ app.post('/api/scrim-blocks', async (req, res) => {
         const gameData = games[idx];
         const gameNumber = idx + 1;
 
-        const gameResult = await pool.query(
+        const gameResult = await client.query(
           `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
           [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result]
         );
 
         const gameId = gameResult.rows[0].id;
 
-        if (gameData.ourPicks) {
+        if (gameData.ourPicks && Array.isArray(gameData.ourPicks)) {
           for (const p of gameData.ourPicks) {
-            await pool.query(
+            await client.query(
               `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
               [gameId, p.championId, 'OUR_TEAM', p.role, 'P1']
             );
           }
         }
 
-        if (gameData.enemyPicks) {
+        if (gameData.enemyPicks && Array.isArray(gameData.enemyPicks)) {
           for (const p of gameData.enemyPicks) {
-            await pool.query(
+            await client.query(
               `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
               [gameId, p.championId, 'ENEMY', p.role, 'P1']
             );
@@ -159,11 +162,15 @@ app.post('/api/scrim-blocks', async (req, res) => {
       }
     }
 
-    console.log(`[DB WRITE SUCCESS] Created new Scrim Block #${blockId} with ${games?.length || 0} games.`);
+    await client.query('COMMIT');
+    console.log(`[DB WRITE SUCCESS] Created Scrim Block #${blockId} with ${games?.length || 0} games.`);
     res.json({ success: true, blockId });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     console.error('[DB WRITE ERROR] Failed to save scrim block:', err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -171,46 +178,49 @@ app.post('/api/scrim-blocks', async (req, res) => {
 app.put('/api/scrim-blocks/:id', async (req, res) => {
   const blockId = req.params.id;
   const { opponentName, notes, games } = req.body;
+  const client = await pool.connect();
 
   try {
-    await pool.query(
+    await client.query('BEGIN');
+
+    await client.query(
       `UPDATE scrim_blocks SET opponent_name = $1, notes = $2 WHERE id = $3`,
       [opponentName, notes, blockId]
     );
 
-    const oldGames = await pool.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [blockId]);
+    const oldGames = await client.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [blockId]);
     const oldGameIds = oldGames.rows.map((g) => g.id);
 
     if (oldGameIds.length > 0) {
-      await pool.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [oldGameIds]);
+      await client.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [oldGameIds]);
     }
 
-    await pool.query(`DELETE FROM scrim_games WHERE block_id = $1`, [blockId]);
+    await client.query(`DELETE FROM scrim_games WHERE block_id = $1`, [blockId]);
 
     if (games && Array.isArray(games)) {
       for (let idx = 0; idx < games.length; idx++) {
         const gameData = games[idx];
         const gameNumber = idx + 1;
 
-        const gameResult = await pool.query(
+        const gameResult = await client.query(
           `INSERT INTO scrim_games (block_id, game_number, patch_version, our_side, result) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
           [blockId, gameNumber, gameData.patchVersion || '', gameData.ourSide, gameData.result]
         );
 
         const gameId = gameResult.rows[0].id;
 
-        if (gameData.ourPicks) {
+        if (gameData.ourPicks && Array.isArray(gameData.ourPicks)) {
           for (const p of gameData.ourPicks) {
-            await pool.query(
+            await client.query(
               `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
               [gameId, p.championId, 'OUR_TEAM', p.role, 'P1']
             );
           }
         }
 
-        if (gameData.enemyPicks) {
+        if (gameData.enemyPicks && Array.isArray(gameData.enemyPicks)) {
           for (const p of gameData.enemyPicks) {
-            await pool.query(
+            await client.query(
               `INSERT INTO draft_picks (game_id, champion_id, team, role, pick_phase) VALUES ($1, $2, $3, $4, $5)`,
               [gameId, p.championId, 'ENEMY', p.role, 'P1']
             );
@@ -219,33 +229,45 @@ app.put('/api/scrim-blocks/:id', async (req, res) => {
       }
     }
 
+    await client.query('COMMIT');
     console.log(`[DB WRITE SUCCESS] Updated Scrim Block #${blockId}.`);
     res.json({ success: true, updatedBlockId: blockId });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     console.error(`[DB WRITE ERROR] Failed to update scrim block #${blockId}:`, err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
 // 6. DELETE: Remove Scrim Block
 app.delete('/api/scrim-blocks/:id', async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect();
 
   try {
-    const games = await pool.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [id]);
+    await client.query('BEGIN');
+
+    const games = await client.query(`SELECT id FROM scrim_games WHERE block_id = $1`, [id]);
     const gameIds = games.rows.map((g) => g.id);
 
     if (gameIds.length > 0) {
-      await pool.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [gameIds]);
-      await pool.query(`DELETE FROM scrim_games WHERE block_id = $1`, [id]);
+      await client.query(`DELETE FROM draft_picks WHERE game_id = ANY($1::int[])`, [gameIds]);
+      await client.query(`DELETE FROM scrim_games WHERE block_id = $1`, [id]);
     }
 
-    await pool.query(`DELETE FROM scrim_blocks WHERE id = $1`, [id]);
+    await client.query(`DELETE FROM scrim_blocks WHERE id = $1`, [id]);
+
+    await client.query('COMMIT');
     console.log(`[DB WRITE SUCCESS] Deleted Scrim Block #${id}.`);
     res.json({ success: true, deletedBlockId: id });
   } catch (err: any) {
+    await client.query('ROLLBACK');
     console.error(`[DB WRITE ERROR] Failed to delete scrim block #${id}:`, err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
