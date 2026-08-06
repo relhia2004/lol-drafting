@@ -300,5 +300,4 @@ app.delete('/api/scrim-blocks/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-export default serverless(app);
+export default app;
