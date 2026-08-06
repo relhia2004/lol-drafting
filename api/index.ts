@@ -1,4 +1,3 @@
-// api/index.ts
 import serverless from 'serverless-http';
 import express from 'express';
 import cors from 'cors';
@@ -300,4 +299,5 @@ app.delete('/api/scrim-blocks/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 export default app;
